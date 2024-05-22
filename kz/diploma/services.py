@@ -1,64 +1,115 @@
-# app/services.py
+# diploma/services.py
 import pandas as pd
 import logging as log
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from scipy.sparse import coo_matrix
+
+
 def generate_recommendations(liked_books, data_loader):
+    # Use preloaded data
     csv_book_mapping = data_loader.csv_book_mapping
     interactions = data_loader.interactions
     books_titles = data_loader.books_titles
 
-    overlap_users = set()
-    for interaction in interactions:
-        user_id, csv_id, _, rating, _ = interaction
-        try:
-            rating = int(rating)
-        except ValueError:
-            continue
-        book_id = csv_book_mapping.get(csv_id)
-        if not book_id:
-            continue
-        if book_id in liked_books and rating >= 4:
-            overlap_users.add(user_id)
+    # Ensure liked_books are mapped correctly
+    liked_books_ids = [csv_book_mapping.get(book) for book in liked_books if book in csv_book_mapping]
+
+    overlap_users = interactions[interactions['book_id'].isin(liked_books_ids) & (interactions['rating'] >= 4)][
+        'user_id'].unique()
 
     log.info(f'Overlap users: {len(overlap_users)}')
 
-    rec_lines = []
-    for interaction in interactions:
-        user_id, csv_id, _, rating, _ = interaction
-        if user_id in overlap_users:
-            book_id = csv_book_mapping.get(csv_id)
-            if not book_id:
-                continue
-            rec_lines.append([user_id, book_id, rating])
+    rec_lines = interactions[interactions['user_id'].isin(overlap_users)]
 
-    log.info(rf'Recommendations: {len(rec_lines)}')
+    log.info(f'Recommendations: {len(rec_lines)}')
 
-    recs = pd.DataFrame(rec_lines, columns=["user_id", "book_id", "rating"])
-    recs["book_id"] = recs["book_id"].astype(str)
+    recs = rec_lines.groupby('book_id').size().reset_index(name='counts').sort_values(by='counts', ascending=False)
+    top_recs = recs.head(10)
 
-    top_recs = recs["book_id"].value_counts().head(10).index.values
-
-    books_titles["book_id"] = books_titles["book_id"].astype(str)
-
-    popular_books = books_titles[books_titles["book_id"].isin(top_recs)]
-
-    all_recs = recs["book_id"].value_counts().to_frame().reset_index()
-    all_recs.columns = ["book_id", "book_count"]
-
-    all_recs = all_recs.merge(books_titles, how="inner", on="book_id")
-
-    all_recs["score"] = all_recs["book_count"] * (all_recs["book_count"] / all_recs["ratings"])
-
-    all_recs.sort_values("score", ascending=False, inplace=True)
-
-    popular_recs = all_recs[all_recs["book_count"] > 75].sort_values("score", ascending=False)
+    popular_books = books_titles[books_titles['book_id'].isin(top_recs['book_id'])]
 
     log.info("Popular books: %s", popular_books)
-    log.info("Popular books second: %s", popular_recs[~popular_recs["book_id"].isin(liked_books)].head(10))
 
-    return popular_recs[~popular_recs["book_id"].isin(liked_books)].head(10)
+    return popular_books
+
 
 def make_clickable(val):
     return f'<a target="_blank" href="{val}">BookHub</a>'
 
+
 def show_image(val):
     return f'<img src="{val}" width=50></img>'
+
+
+def filter_liked_books(file_path, data_loader):
+    # Use preloaded data
+    file_book_id = data_loader.book_map_path
+    file_goodread_int = data_loader.interactions_path
+    file_book_titles = data_loader.book_titles_path
+
+    my_books = pd.read_csv(file_path, index_col=0)
+    my_books["book_id"] = my_books["book_id"].astype(str)
+
+    csv_book_mapping = data_loader.csv_book_mapping
+    book_set = set(my_books["book_id"])
+
+    overlap_users = {}
+    with open(file_goodread_int) as f:
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            user_id, csv_id, _, rating, _ = line.strip().split(",")
+            book_id = csv_book_mapping.get(csv_id)
+            if book_id in book_set:
+                if user_id not in overlap_users:
+                    overlap_users[user_id] = 1
+                else:
+                    overlap_users[user_id] += 1
+
+    filtered_overlap_users = set([k for k in overlap_users if overlap_users[k] > my_books.shape[0] / 20])
+
+    interactions_list = []
+    with open(file_goodread_int) as f:
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            user_id, csv_id, _, rating, _ = line.strip().split(",")
+            if user_id in filtered_overlap_users:
+                book_id = csv_book_mapping[csv_id]
+                interactions_list.append([user_id, book_id, rating])
+
+    interactions = pd.DataFrame(interactions_list, columns=["user_id", "book_id", "rating"])
+    interactions = pd.concat([my_books[["user_id", "book_id", "rating"]], interactions])
+    interactions["book_id"] = interactions["book_id"].astype(str)
+    interactions["user_id"] = interactions["user_id"].astype(str)
+    interactions["rating"] = pd.to_numeric(interactions["rating"])
+    interactions["user_index"] = interactions["user_id"].astype("category").cat.codes
+    interactions["book_index"] = interactions["book_id"].astype("category").cat.codes
+
+    ratings_mat_coo = coo_matrix((interactions["rating"], (interactions["user_index"], interactions["book_index"])))
+    ratings_mat = ratings_mat_coo.tocsr()
+
+    my_index = 0
+    similarity = cosine_similarity(ratings_mat[my_index, :], ratings_mat).flatten()
+    indices = np.argpartition(similarity, -300)[-300:]
+    similar_users = interactions[interactions["user_index"].isin(indices)].copy()
+    similar_users = similar_users[similar_users["user_id"] != "-1"]
+
+    book_recs = similar_users.groupby("book_id").rating.agg(['count', 'mean'])
+    books_titles = data_loader.books_titles
+
+    book_recs = book_recs.merge(books_titles, how="inner", on="book_id")
+    book_recs["adjusted_count"] = book_recs["count"] * (book_recs["count"] / book_recs["ratings"])
+    book_recs["score"] = book_recs["mean"] * book_recs["adjusted_count"]
+    book_recs = book_recs[~book_recs["book_id"].isin(my_books["book_id"])]
+
+    my_books["mod_title"] = my_books["title"].str.replace("[^a-zA-Z0-9 ]", "", regex=True).str.lower()
+    my_books["mod_title"] = my_books["mod_title"].str.replace("\s+", " ", regex=True)
+    book_recs = book_recs[~book_recs["mod_title"].isin(my_books["mod_title"])]
+    book_recs = book_recs[book_recs["count"] > 2]
+    book_recs = book_recs[book_recs["mean"] > 2]
+
+    return book_recs.sort_values("score", ascending=False)

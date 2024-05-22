@@ -1,9 +1,11 @@
+# diploma/__init__.py
 from flask import Flask
 from .data_loader import DataLoader
 
 def create_app():
     app = Flask(__name__)
 
+    # Load data once during app initialization
     book_map_path = 'ml_data/book_id_map.csv'
     interactions_path = 'ml_data/goodreads_interactions.csv'
     book_titles_path = 'ml_data/books_titles.json'
